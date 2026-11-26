@@ -1,1 +1,653 @@
 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xai-fraud-detection: full repository</title>
+<style>
+:root{color-scheme:light dark;--bg:#fff;--fg:#1f2328;--mut:#656d76;--card:#f6f8fa;--bd:#d0d7de;--ac:#0969da}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--mut:#8b949e;--card:#161b22;--bd:#30363d;--ac:#58a6ff}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
+main{max-width:980px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:24px;margin:0 0 4px}
+p.s{color:var(--mut);margin:0 0 20px}
+nav{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px}
+nav a{border:1px solid var(--bd);border-radius:6px;padding:4px 10px;color:var(--ac);text-decoration:none;font:13px ui-monospace,monospace}
+section{border:1px solid var(--bd);border-radius:8px;margin-bottom:20px;overflow:hidden}
+header{display:flex;align-items:center;justify-content:space-between;gap:8px;background:var(--card);border-bottom:1px solid var(--bd);padding:8px 12px}
+header code{font:600 13px ui-monospace,monospace}
+button{background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;margin-left:6px}
+button:hover{border-color:var(--ac)}
+pre{margin:0;padding:12px;overflow-x:auto;max-height:560px;overflow-y:auto;font:12.5px/1.45 ui-monospace,monospace;tab-size:4}
+h2{font-size:17px;margin:28px 0 8px}
+</style>
+</head>
+<body>
+<main>
+<h1>xai-fraud-detection</h1>
+<p class="s">Complete repository in one page. Copy or download each file into the paths shown (VS Code friendly).</p>
+<nav id="nav"></nav>
+<div id="files"></div>
+<h2>Push to GitHub</h2>
+<section><header><code>push.sh</code><span><button data-copy="push">Copy</button><button data-dl="push" data-name="push.sh">Download</button></span></header><pre id="out-push"></pre></section>
+</main>
+
+<script type="text/plain" id="src/data_generator.py">"""
+Synthetic payment ledger generator for the XAI fraud detection engine.
+
+Produces a chronologically ordered transaction table with a ~1.8% fraud rate.
+Fraud labels are drawn from a non-linear logistic risk model so that tree
+ensembles have real structure (thresholds, interactions) to learn.
+"""
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import pandas as pd
+
+TARGET_COLUMN = "is_fraud"
+TIMESTAMP_COLUMN = "tx_timestamp"
+FEATURE_COLUMNS = [
+    "tx_amount",
+    "velocity_1h",
+    "amt_to_avg_ratio",
+    "device_trust_score",
+    "geo_distance_km",
+    "is_international",
+    "account_age_days",
+]
+INTEGER_FEATURES = {"velocity_1h", "is_international", "account_age_days"}
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))
+
+
+def _risk_logit(
+    velocity: np.ndarray,
+    ratio: np.ndarray,
+    trust: np.ndarray,
+    geo: np.ndarray,
+    intl: np.ndarray,
+    age: np.ndarray,
+) -> np.ndarray:
+    """Non-linear log-odds of fraud (before intercept calibration)."""
+    log_ratio = np.log(ratio)
+
+    # Burst activity: linear growth plus a convex penalty past 3 tx / hour
+    velocity_term = 0.50 * velocity + 0.12 * np.maximum(velocity - 3, 0) ** 2
+
+    # Amounts far above the customer's typical spend are disproportionately risky
+    ratio_term = 1.20 * np.maximum(log_ratio, 0) + 0.90 * np.maximum(log_ratio, 0) ** 2
+
+    # Low device trust is penalised quadratically
+    device_term = 4.0 * (1.0 - trust) ** 2
+
+    # Large geo jumps: smooth growth plus a step above 300 km
+    geo_term = 1.00 * np.log1p(geo / 100.0) + 0.80 * (geo > 300)
+
+    # International flag, amplified when the device is also untrusted
+    intl_term = 0.90 * intl + 0.80 * intl * (1.0 - trust)
+
+    # Young accounts decay exponentially in risk
+    age_term = 1.60 * np.exp(-age / 90.0)
+
+    return velocity_term + ratio_term + device_term + geo_term + intl_term + age_term
+
+
+def _calibrate_intercept(base_logit: np.ndarray, target_rate: float) -> float:
+    """Bisection search for the intercept that yields the target mean fraud probability."""
+    lo, hi = -40.0, 20.0
+    for _ in range(80):
+        mid = (lo + hi) / 2.0
+        if _sigmoid(base_logit + mid).mean() > target_rate:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2.0
+
+
+def generate_transactions(
+    n_samples: int = 25_000,
+    fraud_rate: float = 0.018,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Generate a chronologically ordered synthetic payment ledger.
+
+    Returns a DataFrame with FEATURE_COLUMNS, `tx_timestamp` and `is_fraud`.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Chronological timestamps across a 90-day window
+    start = pd.Timestamp("2025-01-01 00:00:00")
+    offsets = np.sort(rng.uniform(0, 90 * 24 * 3600, n_samples))
+    tx_timestamp = start + pd.to_timedelta(offsets, unit="s")
+
+    # Customer baseline spend and the ratio of this transaction to it
+    customer_avg_amount = rng.lognormal(mean=4.0, sigma=0.8, size=n_samples)
+    amt_to_avg_ratio = rng.lognormal(mean=0.0, sigma=0.45, size=n_samples)
+    tx_amount = customer_avg_amount * amt_to_avg_ratio  # lognormal by construction
+
+    velocity_1h = rng.poisson(lam=1.2, size=n_samples)
+    device_trust_score = rng.beta(a=5.0, b=2.0, size=n_samples)
+    geo_distance_km = rng.exponential(scale=60.0, size=n_samples)
+    is_international = rng.binomial(n=1, p=0.08, size=n_samples)
+    account_age_days = np.clip(rng.gamma(shape=2.0, scale=400.0, size=n_samples), 1, 3650).astype(int)
+
+    base_logit = _risk_logit(
+        velocity_1h,
+        amt_to_avg_ratio,
+        device_trust_score,
+        geo_distance_km,
+        is_international,
+        account_age_days,
+    )
+    base_logit = base_logit + rng.normal(0.0, 0.30, size=n_samples)  # irreducible noise
+
+    intercept = _calibrate_intercept(base_logit, fraud_rate)
+    fraud_prob = _sigmoid(base_logit + intercept)
+    is_fraud = rng.binomial(1, fraud_prob)
+
+    df = pd.DataFrame(
+        {
+            TIMESTAMP_COLUMN: tx_timestamp,
+            "tx_amount": np.round(tx_amount, 2),
+            "velocity_1h": velocity_1h,
+            "amt_to_avg_ratio": np.round(amt_to_avg_ratio, 4),
+            "device_trust_score": np.round(device_trust_score, 4),
+            "geo_distance_km": np.round(geo_distance_km, 2),
+            "is_international": is_international,
+            "account_age_days": account_age_days,
+            TARGET_COLUMN: is_fraud,
+        }
+    )
+    return df.sort_values(TIMESTAMP_COLUMN).reset_index(drop=True)
+
+
+if __name__ == "__main__":
+    ledger = generate_transactions()
+    print(f"Rows: {len(ledger):,} | Fraud rate: {ledger[TARGET_COLUMN].mean():.3%}")
+    out_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "transactions.csv")
+    ledger.to_csv(out_path, index=False)
+    print(f"Saved ledger to {out_path}")
+</script>
+
+<script type="text/plain" id="src/reason_codes.py">"""
+Explainability layer: SHAP computation, publication-quality plots and
+regulatory-style audit reason codes.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")  # headless-safe backend
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import shap
+
+from data_generator import INTEGER_FEATURES
+
+ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
+PLOT_DPI = 200
+
+
+def build_explainer(model) -> shap.TreeExplainer:
+    """Create a TreeExplainer; SHAP values are in log-odds (raw margin) space."""
+    return shap.TreeExplainer(model)
+
+
+def compute_shap_explanation(explainer: shap.TreeExplainer, X: pd.DataFrame) -> shap.Explanation:
+    """Compute SHAP values for X and return a 2-D (rows x features) Explanation."""
+    explanation = explainer(X)
+    if explanation.values.ndim == 3:  # some versions return one slice per class
+        explanation = explanation[:, :, 1]
+    return explanation
+
+
+def save_global_summary(explanation: shap.Explanation, assets_dir: Path = ASSETS_DIR) -> Path:
+    """Save the SHAP beeswarm plot showing global feature impact."""
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    out_path = assets_dir / "shap_global_summary.png"
+
+    plt.figure(figsize=(10, 6))
+    shap.plots.beeswarm(explanation, max_display=10, show=False)
+    plt.title("Global Feature Impact on Fraud Risk (SHAP, log-odds)", fontsize=12, pad=12)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=PLOT_DPI, bbox_inches="tight")
+    plt.close("all")
+    return out_path
+
+
+def save_local_waterfall(
+    explanation: shap.Explanation, row_position: int, assets_dir: Path = ASSETS_DIR
+) -> Path:
+    """Save the SHAP waterfall plot for a single transaction (by row position)."""
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    out_path = assets_dir / "shap_local_waterfall.png"
+
+    plt.figure(figsize=(10, 6))
+    shap.plots.waterfall(explanation[row_position], max_display=10, show=False)
+    plt.title("Local Explanation: Highest-Risk Flagged Transaction", fontsize=12, pad=12)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=PLOT_DPI, bbox_inches="tight")
+    plt.close("all")
+    return out_path
+
+
+def _format_value(feature: str, value: float) -> str:
+    if feature in INTEGER_FEATURES:
+        return str(int(round(float(value))))
+    return f"{float(value):.2f}"
+
+
+def extract_reason_codes(
+    shap_row: np.ndarray,
+    feature_row: pd.Series,
+    top_k: int = 3,
+) -> list[str]:
+    """
+    Return the top-k positive SHAP drivers of a flagged transaction as
+    human-readable audit strings, e.g.:
+
+        device_trust_score=0.14 (+1.38 log-odds)
+
+    Only features that push the score toward fraud (SHAP > 0) are eligible.
+    """
+    shap_row = np.asarray(shap_row, dtype=float)
+    feature_names = list(feature_row.index)
+
+    order = np.argsort(shap_row)[::-1]  # descending contribution
+    codes: list[str] = []
+    for idx in order:
+        if shap_row[idx] <= 0 or len(codes) >= top_k:
+            break
+        name = feature_names[idx]
+        codes.append(f"{name}={_format_value(name, feature_row.iloc[idx])} ({shap_row[idx]:+.2f} log-odds)")
+    return codes
+
+
+def build_audit_log(
+    explanation: shap.Explanation,
+    X: pd.DataFrame,
+    probabilities: np.ndarray,
+    flagged_mask: np.ndarray,
+    top_k: int = 3,
+) -> pd.DataFrame:
+    """Build an audit table (one row per flagged transaction) with reason codes."""
+    records = []
+    for pos in np.flatnonzero(flagged_mask):
+        codes = extract_reason_codes(explanation.values[pos], X.iloc[pos], top_k=top_k)
+        records.append(
+            {
+                "ledger_index": X.index[pos],
+                "fraud_probability": round(float(probabilities[pos]), 4),
+                "reason_codes": " | ".join(codes),
+            }
+        )
+    log = pd.DataFrame(records, columns=["ledger_index", "fraud_probability", "reason_codes"])
+    return log.sort_values("fraud_probability", ascending=False).reset_index(drop=True)
+</script>
+
+<script type="text/plain" id="src/train_and_explain.py">"""
+End-to-end pipeline: generate data -> chronological split -> train XGBoost ->
+cost-optimal thresholding -> SHAP explanations -> audit reason codes.
+
+Run from the repository root:
+    python src/train_and_explain.py
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import (
+    average_precision_score,
+    classification_report,
+    roc_auc_score,
+)
+from xgboost import XGBClassifier
+
+from data_generator import FEATURE_COLUMNS, TARGET_COLUMN, generate_transactions
+from reason_codes import (
+    build_audit_log,
+    build_explainer,
+    compute_shap_explanation,
+    extract_reason_codes,
+    save_global_summary,
+    save_local_waterfall,
+)
+
+COST_FALSE_POSITIVE = 15.00   # customer friction / manual review
+COST_FALSE_NEGATIVE = 250.00  # missed fraud chargeback
+
+
+def find_cost_optimal_threshold(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    fp_cost: float = COST_FALSE_POSITIVE,
+    fn_cost: float = COST_FALSE_NEGATIVE,
+) -> tuple[float, float, pd.DataFrame]:
+    """
+    Sweep thresholds from 0.05 to 0.95 and return the one minimising
+    total expected loss = fp_cost * FP + fn_cost * FN.
+
+    Returns (best_threshold, best_total_cost, full_sweep_dataframe).
+    """
+    y_true = np.asarray(y_true)
+    rows = []
+    for threshold in np.linspace(0.05, 0.95, 91):
+        y_pred = (y_proba >= threshold).astype(int)
+        fp = int(((y_pred == 1) & (y_true == 0)).sum())
+        fn = int(((y_pred == 0) & (y_true == 1)).sum())
+        rows.append(
+            {
+                "threshold": round(float(threshold), 2),
+                "false_positives": fp,
+                "false_negatives": fn,
+                "total_cost": fp * fp_cost + fn * fn_cost,
+            }
+        )
+    sweep = pd.DataFrame(rows)
+    best = sweep.loc[sweep["total_cost"].idxmin()]
+    return float(best["threshold"]), float(best["total_cost"]), sweep
+
+
+def main() -> None:
+    # 1. Data -----------------------------------------------------------------
+    df = generate_transactions(n_samples=25_000, fraud_rate=0.018, seed=42)
+    print(f"Generated {len(df):,} transactions | fraud rate: {df[TARGET_COLUMN].mean():.3%}")
+
+    # 2. Strict chronological 80/20 split (no temporal leakage) ----------------
+    split_idx = int(len(df) * 0.8)
+    train_df = df.iloc[:split_idx]
+    test_df = df.iloc[split_idx:]
+
+    X_train, y_train = train_df[FEATURE_COLUMNS], train_df[TARGET_COLUMN]
+    X_test, y_test = test_df[FEATURE_COLUMNS], test_df[TARGET_COLUMN]
+    print(
+        f"Train: {len(train_df):,} rows ({train_df['tx_timestamp'].min():%Y-%m-%d} to "
+        f"{train_df['tx_timestamp'].max():%Y-%m-%d}) | "
+        f"Test: {len(test_df):,} rows ({test_df['tx_timestamp'].min():%Y-%m-%d} to "
+        f"{test_df['tx_timestamp'].max():%Y-%m-%d})"
+    )
+
+    # 3. Model ------------------------------------------------------------------
+    pos = int(y_train.sum())
+    neg = int(len(y_train) - pos)
+    scale_pos_weight = neg / pos
+
+    model = XGBClassifier(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        eval_metric="aucpr",
+        scale_pos_weight=scale_pos_weight,
+        random_state=42,
+    )
+    model.fit(X_train, y_train, verbose=False)
+
+    # 4. Evaluation ---------------------------------------------------------------
+    y_proba = model.predict_proba(X_test)[:, 1]
+    roc_auc = roc_auc_score(y_test, y_proba)
+    pr_auc = average_precision_score(y_test, y_proba)
+
+    best_threshold, best_cost, _ = find_cost_optimal_threshold(y_test.values, y_proba)
+    y_pred = (y_proba >= best_threshold).astype(int)
+    baseline_cost = int(y_test.sum()) * COST_FALSE_NEGATIVE
+
+    print("\n" + "=" * 70)
+    print("MODEL EVALUATION (chronological hold-out set)")
+    print("=" * 70)
+    print(f"scale_pos_weight        : {scale_pos_weight:.2f}")
+    print(f"ROC-AUC                 : {roc_auc:.4f}")
+    print(f"PR-AUC                  : {pr_auc:.4f}")
+    print(f"Cost-optimal threshold  : {best_threshold:.2f}")
+    print(f"Estimated total loss    : ${best_cost:,.2f}")
+    print(f"Loss with no model      : ${baseline_cost:,.2f} (every fraud missed)")
+    print("\nClassification report @ cost-optimal threshold:")
+    print(classification_report(y_test, y_pred, target_names=["legit", "fraud"], digits=4))
+
+    # 5. Explainability --------------------------------------------------------------
+    explainer = build_explainer(model)
+    explanation = compute_shap_explanation(explainer, X_test)
+
+    flagged_mask = y_pred == 1
+    if flagged_mask.any():
+        masked_scores = np.where(flagged_mask, y_proba, -np.inf)
+    else:  # extremely unlikely, but keep the pipeline robust
+        masked_scores = y_proba
+    top_pos = int(np.argmax(masked_scores))
+
+    global_path = save_global_summary(explanation)
+    local_path = save_local_waterfall(explanation, top_pos)
+    print(f"Saved: {global_path}")
+    print(f"Saved: {local_path}")
+
+    # 6. Audit reason codes -------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("TOP FLAGGED TRANSACTION - AUDIT REASON CODES")
+    print("=" * 70)
+    print(f"Ledger index      : {X_test.index[top_pos]}")
+    print(f"Fraud probability : {y_proba[top_pos]:.4f}")
+    print(f"Actual label      : {'FRAUD' if y_test.iloc[top_pos] == 1 else 'LEGIT'}")
+    print("Reason codes:")
+    for rank, code in enumerate(
+        extract_reason_codes(explanation.values[top_pos], X_test.iloc[top_pos], top_k=3), start=1
+    ):
+        print(f"  {rank}. {code}")
+
+    audit_log = build_audit_log(explanation, X_test, y_proba, flagged_mask, top_k=3)
+    print(f"\nAudit log generated for {len(audit_log):,} flagged transactions. Top 5:")
+    with pd.option_context("display.max_colwidth", None, "display.width", 200):
+        print(audit_log.head(5).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
+</script>
+
+<script type="text/plain" id="requirements.txt">numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+shap>=0.46.0
+matplotlib>=3.7.0
+</script>
+
+<script type="text/plain" id=".gitignore"># Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Generated data
+data/*.csv
+</script>
+
+<script type="text/plain" id="README.md"># XAI Financial Fraud Detection Engine
+
+An explainable, cost-sensitive fraud detection pipeline built with XGBoost and SHAP. It scores payment transactions, picks a decision threshold that minimises expected dollar loss, and turns model attributions into human-readable reason codes suitable for compliance audit logs.
+
+## Problem Statement
+
+Card-not-present and account-takeover fraud is rare (~1–2% of volume) but expensive. FinTech risk teams face three constraints at once:
+
+1. **Extreme class imbalance.** Accuracy is meaningless; precision-recall behaviour matters.
+2. **Asymmetric costs.** Missing a fraud triggers a chargeback, while a false alarm creates customer friction and review cost.
+3. **Regulatory explainability.** Adverse-action and model-risk rules (e.g. ECOA/Reg B, SR 11-7, GDPR Art. 22) require specific, defensible reasons for automated decisions.
+
+This project addresses all three: imbalance-aware training, a business-cost decision threshold, and per-transaction SHAP reason codes.
+
+## System Architecture
+
+```
+┌──────────────────┐   ┌────────────────────┐   ┌────────────────────────┐
+│ data_generator   │──▶│ train_and_explain  │──▶│ reason_codes           │
+│ 25k synthetic    │   │ 80/20 chrono split │   │ TreeExplainer (SHAP)   │
+│ payment ledger   │   │ XGBoost + cost     │   │ beeswarm + waterfall   │
+│ (~1.8% fraud)    │   │ threshold sweep    │   │ top-3 audit reason     │
+└──────────────────┘   └────────────────────┘   │ codes per flagged tx   │
+                                                └────────────────────────┘
+```
+
+| Module | Responsibility |
+|---|---|
+| `src/data_generator.py` | Chronological synthetic ledger; non-linear logistic risk model over velocity, amount ratio, device trust, geo-jump, international flag and account age |
+| `src/train_and_explain.py` | Temporal split, XGBoost training with `scale_pos_weight`, evaluation, cost-optimal threshold search, orchestration |
+| `src/reason_codes.py` | SHAP computation, 200-DPI plots, `extract_reason_codes()` and audit-log builder |
+
+**Leakage control:** the split is strictly chronological (`df.iloc[:split_idx]` for training, `df.iloc[split_idx:]` for testing), so the model never sees the future.
+
+## Cost-Sensitive Optimization Formula
+
+The decision threshold $t$ is chosen to minimise total expected financial loss on the hold-out set:
+
+$$
+t^{*} = \arg\min_{t \in [0.05,\,0.95]} \Big( C_{FP} \cdot FP(t) + C_{FN} \cdot FN(t) \Big)
+$$
+
+where $C_{FP} = \$15.00$ (review / customer friction cost) and $C_{FN} = \$250.00$ (chargeback cost). Because $C_{FN} / C_{FP} \approx 16.7$, the optimum typically sits well below the default 0.50 cut-off.
+
+## Explainability
+
+SHAP values are computed with `shap.TreeExplainer` and expressed in **log-odds**, so contributions add up exactly to the model's raw score.
+
+### Global feature impact
+
+[![SHAP global summary](assets/shap_global_summary.png)](assets/shap_global_summary.png)
+
+[View `assets/shap_global_summary.png`](assets/shap_global_summary.png)
+
+### Local explanation for the highest-risk flagged transaction
+
+[![SHAP local waterfall](assets/shap_local_waterfall.png)](assets/shap_local_waterfall.png)
+
+[View `assets/shap_local_waterfall.png`](assets/shap_local_waterfall.png)
+
+### Audit reason codes
+
+`extract_reason_codes()` returns the top 3 features pushing a transaction toward fraud, in this format (illustrative):
+
+```
+1. device_trust_score=0.14 (+1.38 log-odds)
+2. velocity_1h=6 (+1.02 log-odds)
+3. account_age_days=12 (+0.77 log-odds)
+```
+
+## Quickstart
+
+```bash
+# 1. Clone and enter the repo
+git clone https://github.com/<your-username>/xai-fraud-detection.git
+cd xai-fraud-detection
+
+# 2. Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Run the full pipeline (trains, evaluates, writes plots to assets/)
+python src/train_and_explain.py
+
+# Optional: export the synthetic ledger to data/transactions.csv
+python src/data_generator.py
+```
+
+The run prints ROC-AUC, PR-AUC, the cost-optimal threshold, estimated total dollar loss, a full classification report, and the audit reason codes of the top flagged transaction.
+
+## Repository Layout
+
+```
+xai-fraud-detection/
+├── assets/                  # Saved SHAP PNG charts
+├── src/
+│   ├── data_generator.py
+│   ├── reason_codes.py
+│   └── train_and_explain.py
+├── .gitignore
+├── requirements.txt
+└── README.md
+```
+
+## Disclaimer
+
+All data is synthetic. This is a portfolio demonstration, not a production fraud system.
+</script>
+
+<script type="text/plain" id="push">#!/usr/bin/env bash
+# Run from the folder that CONTAINS xai-fraud-detection/ (after saving all files).
+# Create an empty GitHub repo named xai-fraud-detection first (no README / .gitignore).
+set -e
+cd xai-fraud-detection
+
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python src/train_and_explain.py      # generates the PNGs in assets/
+touch assets/.gitkeep
+
+git init
+git add .
+git commit -m "feat: explainable AI fraud detection engine (XGBoost + SHAP)"
+git branch -M main
+git remote add origin https://github.com/<your-username>/xai-fraud-detection.git
+git push -u origin main
+
+# Alternative with GitHub CLI (replaces the remote/push lines above):
+# gh repo create xai-fraud-detection --public --source=. --remote=origin --push
+</script>
+
+<script>
+const ids=["src/data_generator.py","src/reason_codes.py","src/train_and_explain.py","requirements.txt",".gitignore","README.md"];
+const raw=id=>document.getElementById(id).textContent.replace(/^\n/,"");
+const nav=document.getElementById("nav"),box=document.getElementById("files");
+ids.forEach((id,i)=>{
+  const a=document.createElement("a");a.href="#f"+i;a.textContent=id;nav.appendChild(a);
+  const s=document.createElement("section");s.id="f"+i;
+  s.innerHTML='<header><code></code><span><button data-copy="">Copy</button><button data-dl="" data-name="">Download</button></span></header><pre></pre>';
+  s.querySelector("code").textContent=id;
+  s.querySelector("[data-copy]").dataset.copy=id;
+  const d=s.querySelector("[data-dl]");d.dataset.dl=id;d.dataset.name=id.split("/").pop();
+  s.querySelector("pre").textContent=raw(id);
+  box.appendChild(s);
+});
+document.getElementById("out-push").textContent=raw("push");
+document.addEventListener("click",e=>{
+  const b=e.target.closest("button");if(!b)return;
+  if(b.dataset.copy){
+    const t=raw(b.dataset.copy),done=()=>{const o=b.textContent;b.textContent="Copied";setTimeout(()=>b.textContent=o,1200)};
+    if(navigator.clipboard)navigator.clipboard.writeText(t).then(done).catch(()=>{});
+    else{const x=document.createElement("textarea");x.value=t;document.body.appendChild(x);x.select();document.execCommand("copy");x.remove();done()}
+  }else if(b.dataset.dl){
+    const u=URL.createObjectURL(new Blob([raw(b.dataset.dl)],{type:"text/plain"}));
+    const a=document.createElement("a");a.href=u;a.download=b.dataset.name;a.click();URL.revokeObjectURL(u);
+  }
+});
+</script>
+</body>
+</html>
